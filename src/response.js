@@ -71,9 +71,9 @@ class Socket extends EventEmitter {
 module.exports = class Response extends Writable {
     #socket = null;
     #ended = false;
-    #pendingChunks = [];
-    #lastWriteChunkTime = 0;
-    #writeTimeout = null;
+    #nativeBackpressure = false;
+    #nativeWritableHandler = null;
+    #nativeWritableRegistered = false;
     req;
     constructor(res, req, app) {
         super();
@@ -131,6 +131,42 @@ module.exports = class Response extends Writable {
         return this.#socket;
     }
 
+    write(chunk, encoding, cb) {
+        // Mirror native uWS backpressure into Writable so pipe() can pause on the real socket pressure.
+        this.#nativeBackpressure = this.writingChunk;
+        const ok = super.write(chunk, encoding, cb);
+        if(this.#nativeBackpressure) {
+            this._writableState.needDrain = true;
+            return false;
+        }
+        return ok;
+    }
+
+    #finishWritable() {
+        this.finished = true;
+        this.writingChunk = false;
+        this.#nativeWritableHandler = null;
+        this.#ended = true;
+        this.once('close', () => {
+            this.#socket?.emit('close');
+        });
+        super.end();
+    }
+
+    #ensureNativeWritable() {
+        if(this.#nativeWritableRegistered) {
+            return;
+        }
+        this.#nativeWritableRegistered = true;
+        this._res.onWritable((offset) => {
+            const handler = this.#nativeWritableHandler;
+            if(!handler || this.finished) {
+                return true;
+            }
+            return handler(offset);
+        });
+    }
+
     _write(chunk, encoding, callback) {
         if (this.aborted) {
             const err = new Error('Request aborted');
@@ -157,63 +193,51 @@ module.exports = class Response extends Writable {
             }
     
             if (this.chunkedTransfer) {
-                this.#pendingChunks.push(chunk);
-                const size = this.#pendingChunks.reduce((acc, chunk) => acc + chunk.byteLength, 0);
-                const now = performance.now();
-                // the first chunk is sent immediately (!this.#lastWriteChunkTime)
-                // the other chunks are sent when watermark is reached (size >= HIGH_WATERMARK) 
-                // or if elapsed 50ms of last send (now - this.#lastWriteChunkTime > 50)
-                if (!this.#lastWriteChunkTime || size >= HIGH_WATERMARK || now - this.#lastWriteChunkTime > 50) {
-                    this._res.write(Buffer.concat(this.#pendingChunks, size));
-                    this.#pendingChunks = [];
-                    this.#lastWriteChunkTime = now;
-                    if(this.#writeTimeout) {
-                        clearTimeout(this.#writeTimeout);
-                        this.#writeTimeout = null;
-                    }
-                } else if(!this.#writeTimeout) {
-                    this.#writeTimeout = setTimeout(() => {
-                        this.#writeTimeout = null;
-                        if(!this.finished && !this.aborted) this._res.cork(() => {
-                            if(this.#pendingChunks.length) {
-                                const size = this.#pendingChunks.reduce((acc, chunk) => acc + chunk.byteLength, 0);
-                                this._res.write(Buffer.concat(this.#pendingChunks, size));
-                                this.#pendingChunks = [];
-                                this.#lastWriteChunkTime = performance.now();
-                            }
-                        });
-                    }, 50);
-                    this.#writeTimeout.unref();
+                const ok = this._res.write(chunk);
+                if(!ok) {
+                    this.#nativeBackpressure = true;
+                    this.#nativeWritableHandler = () => {
+                        if(this.finished) {
+                            this.#nativeWritableHandler = null;
+                            return true;
+                        }
+                        this.#nativeWritableHandler = null;
+                        this.writingChunk = false;
+                        callback(null);
+                        return true;
+                    };
+                    this.#ensureNativeWritable();
+                } else {
+                    this.writingChunk = false;
+                    callback(null);
                 }
-                this.writingChunk = false;
-                callback(null);
             } else {
                 const lastOffset = this._res.getWriteOffset();
                 const [ok, done] = this._res.tryEnd(chunk, this.totalSize);
                 if (done) {
-                    super.end();
-                    this.finished = true;
-                    this.writingChunk = false;
-                    this.#socket?.emit('close');
+                    this.#finishWritable();
                     callback(null);
                 } else if (!ok) {
+                    this.#nativeBackpressure = true;
                     this._res.ab = chunk;
                     this._res.abOffset = lastOffset;
-                    let handlerUsed = false;
-                    this._res.onWritable((offset) => {
-                        if (this.finished || handlerUsed) return true;
+                    this.#nativeWritableHandler = (offset) => {
+                        if (this.finished) {
+                            this.#nativeWritableHandler = null;
+                            return true;
+                        }
                         const [ok, done] = this._res.tryEnd(this._res.ab.slice(offset - this._res.abOffset), this.totalSize);
                         if (done) {
-                            this.finished = true;
-                            this.#socket?.emit('close');
+                            this.#finishWritable();
                         }
                         if (ok) {
+                            this.#nativeWritableHandler = null;
                             this.writingChunk = false;
-                            handlerUsed = true;
                             callback(null);
                         }
                         return ok;
-                    });
+                    };
+                    this.#ensureNativeWritable();
                 } else {
                     this.writingChunk = false;
                     callback(null);
@@ -274,15 +298,18 @@ module.exports = class Response extends Writable {
         if(typeof cb !== 'function') {
             cb = undefined; // silence the error?
         }
+        if(cb) {
+            this.once('finish', cb);
+        }
 
         if(this.writingChunk) {
             this.once('drain', () => {
-                this.end(data, cb);
+                this.end(data);
             });
-            return;
+            return this;
         }
         if(this.finished) {
-            return;
+            return this;
         }
         this.writeHead(this.statusCode);
         this._res.cork(() => {
@@ -297,14 +324,7 @@ module.exports = class Response extends Writable {
                 this.writeHeaders(true);
                 if(fresh) {
                     this._res.end();
-                    this.finished = true;
-                    this.#socket?.emit('close');
-                    this.emit('finish');
-                    this.emit('close');
-                    cb && queueMicrotask(() => {
-                        this.#ended = true;
-                        cb();
-                    });
+                    this.#finishWritable();
                     return;
                 }
             }
@@ -312,11 +332,6 @@ module.exports = class Response extends Writable {
             if(!data && contentLength) {
                 this._res.endWithoutBody(contentLength.toString());
             } else {
-                if(this.#pendingChunks.length) {
-                    this._res.write(Buffer.concat(this.#pendingChunks));
-                    this.#pendingChunks = [];
-                    this.lastWriteChunkTime = 0;
-                }
                 if(data instanceof Buffer) {
                     data = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
                 }
@@ -327,15 +342,8 @@ module.exports = class Response extends Writable {
                     this._res.end(data);
                 }
             }
-            
-            this.finished = true;
-            this.#socket?.emit('close');
-            this.emit('finish');
-            this.emit('close');
-            cb && queueMicrotask(() => {
-                this.#ended = true;
-                cb();
-            });
+
+            this.#finishWritable();
         });
         return this;
     }
