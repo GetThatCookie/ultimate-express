@@ -142,11 +142,18 @@ module.exports = class Response extends Writable {
 
         this.writingChunk = true;
         this._res.cork(() => {
-            if (!this.headersSent) {
+            const firstWrite = !this.headersSent;
+            if (firstWrite) {
                 this.writeHead(this.statusCode);
                 const statusMessage = this.statusText ?? statuses.message[this.statusCode] ?? '';
                 this._res.writeStatus(`${this.statusCode} ${statusMessage}`.trim());
                 this.writeHeaders(typeof chunk === 'string');
+            }
+
+            if (this.req.method === 'HEAD') {
+                this.writingChunk = false;
+                callback(null);
+                return;
             }
     
             if (!Buffer.isBuffer(chunk) && !(chunk instanceof ArrayBuffer)) {
@@ -155,19 +162,34 @@ module.exports = class Response extends Writable {
             }
     
             if (this.chunkedTransfer) {
-                const ok = this._res.write(chunk);
+                const lastOffset = firstWrite ? 0 : this._res.getWriteOffset();
+                const ok = this._res.tryWrite(chunk);
                 if (ok) {
                     this.writingChunk = false;
                     callback(null);
                 } else {
                     this.#pendingCallback = callback;
-                    this._res.onWritable(() => {
+                    const baseOffset = lastOffset;
+                    this._res.onWritable((offset) => {
                         if (this.aborted || this.finished) return true;
-                        const cb = this.#pendingCallback;
-                        this.#pendingCallback = null;
-                        this.writingChunk = false;
-                        if (cb) cb(null);
-                        return true;
+                        let ok;
+                        this._res.cork(() => {
+                            if (chunk === null) {
+                                ok = this._res.tryWrite('');
+                                return;
+                            }
+                            const written = offset - baseOffset;
+                            const remaining = Buffer.isBuffer(chunk) ? chunk.subarray(written) : new Uint8Array(chunk, written);
+                            ok = this._res.tryWrite(remaining);
+                        });
+                        if (ok && chunk !== null) {
+                            chunk = null;
+                            const cb = this.#pendingCallback;
+                            this.#pendingCallback = null;
+                            this.writingChunk = false;
+                            if (cb) cb(null);
+                        }
+                        return ok;
                     });
                 }
             } else {
@@ -259,9 +281,17 @@ module.exports = class Response extends Writable {
         }
 
         if(this.writingChunk) {
-            this.once('drain', () => {
-                this.end(data, cb);
-            });
+            if(this.chunkedTransfer && this.#pendingCallback) {
+                const pending = this.#pendingCallback;
+                this.#pendingCallback = (err) => {
+                    pending(err);
+                    if(!err) this.end(data, cb);
+                };
+            } else {
+                this.once('drain', () => {
+                    this.end(data, cb);
+                });
+            }
             return;
         }
         if(this.finished) {
@@ -269,7 +299,8 @@ module.exports = class Response extends Writable {
         }
         this.writeHead(this.statusCode);
         this._res.cork(() => {
-            if(!this.headersSent) {
+            const firstWrite = !this.headersSent;
+            if(firstWrite) {
                 const etagFn = this.app.get('etag fn');
                 if(etagFn && data && !this.headers['etag'] && !this.req.noEtag) {
                     this.headers['etag'] = etagFn(data);
@@ -299,8 +330,11 @@ module.exports = class Response extends Writable {
                     data = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
                 }
                 if(this.req.method === 'HEAD') {
-                    const length = Buffer.byteLength(data ?? '');
-                    this._res.endWithoutBody(length.toString());
+                    if(firstWrite) {
+                        this._res.endWithoutBody(Buffer.byteLength(data ?? '').toString());
+                    } else {
+                        this._res.endWithoutBody();
+                    }
                 } else {
                     this._res.end(data);
                 }
